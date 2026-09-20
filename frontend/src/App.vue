@@ -79,7 +79,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useOpticsStore } from './store/optics'
 
 const store = useOpticsStore()
@@ -104,17 +104,28 @@ function wavelengthToRGB(nm: number): [number, number, number] {
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)]
 }
 
+// 渲染前把画布位图同步到当前 CSS 尺寸；尺寸变化时重设 width/height 会
+// 自动清空画布，避免缩放后残留旧尺寸。返回 null 表示画布不可绘制。
+function prepareCanvas(canvas: HTMLCanvasElement | null) {
+  if (!canvas) return null
+  const W = Math.floor(canvas.clientWidth)
+  const H = Math.floor(canvas.clientHeight) || 200
+  if (W <= 0) return null
+  if (canvas.width !== W) canvas.width = W
+  if (canvas.height !== H) canvas.height = H
+  const ctx = canvas.getContext('2d')
+  return ctx ? { ctx, W, H } : null
+}
+
 function drawPattern() {
-  const canvas = patternRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
+  const prepared = prepareCanvas(patternRef.value)
+  if (!prepared) return
+  const { ctx, W, H } = prepared
   ctx.fillStyle = 'black'
   ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const data = store.intensityData
+  if (!data.length) return // 空数据：画布已清空，不残留上一组画面
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
     const intensity = data[idx] || 0
@@ -125,29 +136,28 @@ function drawPattern() {
 }
 
 function drawIntensity() {
-  const canvas = intensityRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
+  const prepared = prepareCanvas(intensityRef.value)
+  if (!prepared) return
+  const { ctx, W, H } = prepared
   ctx.fillStyle = '#0f172a'
   ctx.fillRect(0, 0, W, H)
   const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const data = store.intensityData
-  ctx.beginPath()
-  ctx.strokeStyle = `rgb(${r},${g},${b})`
-  ctx.lineWidth = 2
-  data.forEach((v, i) => {
-    const x = i / (data.length - 1) * W
-    const y = H - v * (H - 10) - 5
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-  })
-  ctx.stroke()
-  // Fill
-  ctx.fillStyle = `rgba(${r},${g},${b},0.15)`
-  ctx.lineTo(W, H); ctx.lineTo(0, H)
-  ctx.closePath(); ctx.fill()
+  if (data.length) {
+    ctx.beginPath()
+    ctx.strokeStyle = `rgb(${r},${g},${b})`
+    ctx.lineWidth = 2
+    data.forEach((v, i) => {
+      const x = i / (data.length - 1) * W
+      const y = H - v * (H - 10) - 5
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+    })
+    ctx.stroke()
+    // Fill
+    ctx.fillStyle = `rgba(${r},${g},${b},0.15)`
+    ctx.lineTo(W, H); ctx.lineTo(0, H)
+    ctx.closePath(); ctx.fill()
+  }
   // Axes
   ctx.strokeStyle = '#475569'; ctx.lineWidth = 1; ctx.setLineDash([3, 3])
   ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke()
@@ -157,14 +167,12 @@ function drawIntensity() {
 }
 
 function drawHeatmap() {
-  const canvas = heatmapRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
+  const prepared = prepareCanvas(heatmapRef.value)
+  if (!prepared) return
+  const { ctx, W, H } = prepared
   const data = store.intensityData
+  if (!data.length) { ctx.clearRect(0, 0, W, H); return } // 空数据：清空，不残留旧图
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const imgData = ctx.createImageData(W, H)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
@@ -181,6 +189,32 @@ function drawHeatmap() {
 
 function renderAll() { drawPattern(); drawIntensity(); drawHeatmap() }
 
-onMounted(() => { store.compute(); setTimeout(renderAll, 100) })
-watch(() => store.intensityData, () => renderAll(), { deep: true })
+// 统一渲染调度：同一帧内的多次触发（快速连续调参/切换实验）只渲染一次，
+// 且回调在当帧 DOM 与布局更新后执行，保证画面始终对应最新参数与最新尺寸
+let rafId = 0
+function scheduleRender() {
+  if (rafId) return
+  rafId = requestAnimationFrame(() => {
+    rafId = 0
+    renderAll()
+  })
+}
+
+// 窗口缩放或布局变化导致画布 CSS 尺寸变化时重绘
+const resizeObserver = new ResizeObserver(() => scheduleRender())
+
+onMounted(() => {
+  store.compute() // 重新打开时按当前参数重算，保证状态与参数对应
+  scheduleRender()
+  for (const el of [patternRef.value, intensityRef.value, heatmapRef.value]) {
+    if (el) resizeObserver.observe(el)
+  }
+})
+
+onBeforeUnmount(() => {
+  if (rafId) cancelAnimationFrame(rafId)
+  resizeObserver.disconnect()
+})
+
+watch(() => store.intensityData, scheduleRender)
 </script>
