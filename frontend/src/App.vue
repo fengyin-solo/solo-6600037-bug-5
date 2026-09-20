@@ -79,7 +79,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useOpticsStore } from './store/optics'
 
 const store = useOpticsStore()
@@ -104,17 +104,28 @@ function wavelengthToRGB(nm: number): [number, number, number] {
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)]
 }
 
+// 同步画布位图尺寸（尺寸变化时赋值会自动清空画布），返回上下文与最新尺寸
+function prepareCanvas(canvas: HTMLCanvasElement | null) {
+  if (!canvas) return null
+  const w = canvas.clientWidth
+  const h = canvas.clientHeight || 200
+  if (!w || !h) return null
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w
+    canvas.height = h
+  }
+  return { ctx: canvas.getContext('2d')!, w, h }
+}
+
 function drawPattern() {
-  const canvas = patternRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
+  const prepared = prepareCanvas(patternRef.value)
+  if (!prepared) return
+  const { ctx, w: W, h: H } = prepared
   ctx.fillStyle = 'black'
   ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const data = store.intensityData
+  if (data.length < 2) return // 空数据：已清空，不残留旧图
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
     const intensity = data[idx] || 0
@@ -125,16 +136,14 @@ function drawPattern() {
 }
 
 function drawIntensity() {
-  const canvas = intensityRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
+  const prepared = prepareCanvas(intensityRef.value)
+  if (!prepared) return
+  const { ctx, w: W, h: H } = prepared
   ctx.fillStyle = '#0f172a'
   ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const data = store.intensityData
+  if (data.length < 2) return // 空数据：已清空，不残留旧图
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   ctx.beginPath()
   ctx.strokeStyle = `rgb(${r},${g},${b})`
   ctx.lineWidth = 2
@@ -157,14 +166,16 @@ function drawIntensity() {
 }
 
 function drawHeatmap() {
-  const canvas = heatmapRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
+  const prepared = prepareCanvas(heatmapRef.value)
+  if (!prepared) return
+  const { ctx, w: W, h: H } = prepared
   const data = store.intensityData
+  if (data.length < 2) { // 空数据：清空为黑，不残留旧图
+    ctx.fillStyle = 'black'
+    ctx.fillRect(0, 0, W, H)
+    return
+  }
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const imgData = ctx.createImageData(W, H)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
@@ -181,6 +192,29 @@ function drawHeatmap() {
 
 function renderAll() { drawPattern(); drawIntensity(); drawHeatmap() }
 
-onMounted(() => { store.compute(); setTimeout(renderAll, 100) })
-watch(() => store.intensityData, () => renderAll(), { deep: true })
+// 统一渲染管线：实验切换 / 参数调节 / 数据更新都汇聚到这里。
+// flush: 'post' 保证 DOM 与布局稳定后再读取画布尺寸并绘制，
+// 每次绘制直接读取 store 最新状态，快速连续操作也不会数据/尺寸不同步。
+watch(
+  [() => store.currentExperiment, () => store.params.wavelength, () => store.intensityData],
+  () => renderAll(),
+  { flush: 'post' }
+)
+
+let resizeObserver: ResizeObserver | null = null
+
+onMounted(() => {
+  store.compute() // 重新打开实验时按当前参数重算，状态与参数对应
+  renderAll()
+  // 窗口缩放或布局变化导致画布尺寸变化时，同步位图尺寸并重绘
+  resizeObserver = new ResizeObserver(() => renderAll())
+  for (const canvas of [patternRef.value, intensityRef.value, heatmapRef.value]) {
+    if (canvas) resizeObserver.observe(canvas)
+  }
+})
+
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+})
 </script>
